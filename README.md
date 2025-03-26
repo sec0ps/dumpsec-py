@@ -21,20 +21,6 @@ This tool provides full visibility into local Windows system security settings, 
 
 ---
 
-## 📂 Current Project Structure
-
-dumpsec_py/
-├── main.py
-├── users_groups.py
-├── file_shares.py
-├── registry_audit.py
-├── services_tasks.py
-├── local_policy.py
-├── domain_info.py
-├── permissions.py
-
----
-
 ## ⚙️ Requirements
 
 - Windows OS (PowerShell or CMD)
@@ -42,4 +28,4 @@ dumpsec_py/
 - Run as Administrator for full access
 - Install required libraries:
 
-pip install pywin32
+pip install -r requirements.txt
