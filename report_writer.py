@@ -1,4 +1,4 @@
-# =============================================================================
+    # =============================================================================
 # DumpSec-Py - Windows Security Auditing Tool
 # =============================================================================
 #
@@ -170,66 +170,49 @@ def write_json(data, path):
         print(f"[!] Failed to write JSON: {e}")
 
 def write_pdf(data, path):
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.units import inch
+
     try:
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.enums import TA_LEFT
-        from reportlab.lib.pagesizes import LETTER
-        from reportlab.lib.units import inch
-
-        doc = SimpleDocTemplate(
-            path,
-            pagesize=LETTER,
-            rightMargin=72,
-            leftMargin=72,
-            topMargin=72,
-            bottomMargin=72
-        )
-
+        doc = SimpleDocTemplate(path, pagesize=LETTER, rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=72)
         styles = getSampleStyleSheet()
-        styles.add(ParagraphStyle(name='SectionHeader', fontSize=14, leading=18, spaceAfter=12, spaceBefore=16, alignment=TA_LEFT, fontName='Helvetica-Bold'))
-        styles.add(ParagraphStyle(name='Entry', fontSize=10.5, leading=14, alignment=TA_LEFT))
+        styles.add(ParagraphStyle(name='SectionHeader', fontSize=14, leading=18, spaceAfter=10, spaceBefore=20, alignment=TA_LEFT, fontName='Helvetica-Bold'))
+        styles.add(ParagraphStyle(name='Content', fontSize=10.5, leading=14, alignment=TA_LEFT))
         styles.add(ParagraphStyle(name='Risk', fontSize=10.5, leading=14, alignment=TA_LEFT, textColor='red'))
 
         elements = []
-
         elements.append(Paragraph("DumpSec-Py Security Audit Report", styles["Title"]))
-        elements.append(Spacer(1, 0.3 * inch))
+        elements.append(Spacer(1, 0.25 * inch))
 
         for section, content in data.items():
             if section == "_risks":
                 continue
-
             elements.append(Paragraph(section, styles["SectionHeader"]))
 
-            if isinstance(content, dict):
+            if isinstance(content, list):
+                for line in content:
+                    elements.append(Paragraph(str(line), styles["Content"]))
+            elif isinstance(content, dict):
                 for key, value in content.items():
                     if key == "_risks":
                         continue
-                    elements.append(Paragraph(f"{key}:", styles["Entry"]))
+                    # If value is a list, join into a single line
                     if isinstance(value, list):
-                        for item in value:
-                            elements.append(Paragraph(f"  - {item}", styles["Entry"]))
-                    elif isinstance(value, dict):
-                        for subkey, sublist in value.items():
-                            elements.append(Paragraph(f"  {subkey}:", styles["Entry"]))
-                            if sublist:
-                                for subitem in sublist:
-                                    elements.append(Paragraph(f"    - {subitem}", styles["Entry"]))
-                            else:
-                                elements.append(Paragraph("    (no members)", styles["Entry"]))
+                        value_str = "\n".join(str(v) for v in value)
                     else:
-                        elements.append(Paragraph(f"  {value}", styles["Entry"]))
-                if "_risks" in content and content["_risks"]:
-                    elements.append(Paragraph("!! Risk Findings:", styles["Risk"]))
-                    for risk in content["_risks"]:
-                        risk_text = f"[{risk['severity']}] {risk['category']}: {risk['description']}"
-                        elements.append(Paragraph(risk_text, styles["Risk"]))
-            elif isinstance(content, list):
-                for item in content:
-                    elements.append(Paragraph(f"  - {item}", styles["Entry"]))
+                        value_str = str(value)
+                    elements.append(Paragraph(f"{key}: {value_str}", styles["Content"]))
             else:
-                elements.append(Paragraph(str(content), styles["Entry"]))
+                elements.append(Paragraph(str(content), styles["Content"]))
+
+            if isinstance(content, dict) and "_risks" in content and content["_risks"]:
+                elements.append(Spacer(1, 0.1 * inch))
+                elements.append(Paragraph("Risk Findings:", styles["Content"]))
+                for risk in content["_risks"]:
+                    elements.append(Paragraph(f"[{risk['severity']}] {risk['category']}: {risk['description']}", styles["Risk"]))
 
             elements.append(Spacer(1, 0.2 * inch))
 
