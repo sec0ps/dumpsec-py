@@ -67,45 +67,55 @@ def cli_mode(args):
         print(f"[+] Report saved as {report_name}.{args.output_format}")
 
 def interactive_menu():
-    print("==== DumpSec-Py Interactive Menu ====")
-    print("Select modules to run (comma-separated, or type 'all'):")
-    for key, (label, _) in MODULES.items():
-        print(f"  {key}. {label}")
+    try:
+        while True:
+            print("\n==== DumpSec-Py Interactive Menu ====")
+            print("Select modules to run (comma-separated), or type 'all' to run all.")
+            for key, (label, _) in MODULES.items():
+                print(f"  {key}. {label}")
+            print("  0. Exit")
 
-    selected = input("\nEnter module numbers: ").strip()
-    selected_keys = MODULES.keys() if selected.lower() == "all" else [x.strip() for x in selected.split(",")]
+            selected = input("\nEnter module numbers (or 'exit'): ").strip().lower()
+            if selected in ("0", "exit", "quit"):
+                print("Exiting. Goodbye!")
+                return
 
-    results = {}
-    for key in selected_keys:
-        if key in MODULES:
-            label, func = MODULES[key]
-            print(f"\n[*] Running {label}...")
-            results[label] = func()
-        else:
-            print(f"[!] Invalid module selection: {key}")
+            selected_keys = MODULES.keys() if selected == "all" else [x.strip() for x in selected.split(",")]
 
-    print("\nAvailable output formats: txt, json, pdf, html, csv, all")
-    formats = input("Enter output formats (comma-separated or 'all'): ").strip().lower().split(",")
-    formats = [f.strip() for f in formats if f.strip()]
+            results = {}
+            for key in selected_keys:
+                if key in MODULES:
+                    label, func = MODULES[key]
+                    print(f"\n[*] Running {label}...")
+                    results[label] = func()
+                else:
+                    print(f"[!] Invalid module selection: {key}")
 
-    if "all" in formats:
-        formats = ["txt", "json", "pdf", "html", "csv"]
-    else:
-        formats = [f for f in formats if f in OUTPUT_FORMATS]
+            print("\nAvailable output formats: txt, json, pdf, html, csv, all")
+            formats = input("Enter output formats (comma-separated or 'all'): ").strip().lower().split(",")
+            formats = [f.strip() for f in formats if f.strip()]
 
-    if not formats:
-        print("[!] No valid output formats selected. Exiting.")
-        return
+            if "all" in formats:
+                formats = ["txt", "json", "pdf", "html", "csv"]
+            else:
+                formats = [f for f in formats if f in OUTPUT_FORMATS]
 
-    default_name = f"dumpsec_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    report_name = input(f"Enter report name (default: {default_name}): ").strip() or default_name
+            if not formats:
+                print("[!] No valid output formats selected. Returning to menu.")
+                continue
 
-    min_risk = input("Minimum risk severity to include (low, medium, high)? Leave blank for all: ").strip().lower()
-    min_risk = min_risk if min_risk in RISK_LEVELS else None
+            default_name = f"dumpsec_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            report_name = input(f"Enter report name (default: {default_name}): ").strip() or default_name
 
-    for fmt in formats:
-        write_report(results, fmt, report_name, min_risk)
-        print(f"[+] Saved {report_name}.{fmt}")
+            min_risk = input("Minimum risk severity to include (low, medium, high)? Leave blank for all: ").strip().lower()
+            min_risk = min_risk if min_risk in RISK_LEVELS else None
+
+            for fmt in formats:
+                write_report(results, fmt, report_name, min_risk)
+                print(f"[+] Saved {report_name}.{fmt}")
+
+    except KeyboardInterrupt:
+        print("\n[!] Keyboard interrupt received. Exiting gracefully.")
 
 def check_for_updates():
     print("\n=== Checking for updates from GitHub... ===")
@@ -156,19 +166,21 @@ def check_for_updates():
     return updated
 
 def main():
-    # Check for updates before doing anything else
-    check_for_updates()
+    try:
+        check_for_updates()
 
-    args = parse_args()
+        args = parse_args()
 
-    if args.watch:
-        monitor_changes()
-        return
+        if args.watch:
+            monitor_changes()
+            return
 
-    if args.output_format:
-        cli_mode(args)
-    else:
-        interactive_menu()
+        if args.output_format:
+            cli_mode(args)
+        else:
+            interactive_menu()
+    except KeyboardInterrupt:
+        print("\n[!] Keyboard interrupt received. Exiting.")
 
 if __name__ == "__main__":
     main()
