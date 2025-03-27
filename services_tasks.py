@@ -40,33 +40,34 @@ risk = RiskEngine()
 def get_services():
     services = []
     risks = []
-    
+
     try:
-        scm_handle = win32service.OpenSCManager(None, None, win32con.SC_MANAGER_ENUMERATE_SERVICE)  # Make sure SC_MANAGER_ENUMERATE_SERVICE is available
-        statuses = win32service.EnumServicesStatusEx(
-            scm_handle,
-            win32service.SC_ENUM_PROCESS_INFO,
-            win32service.SERVICE_WIN32,
-            win32service.SERVICE_STATE_ALL,
-            None
+        scm_handle = win32service.OpenSCManager(
+            None,
+            None,
+            win32service.SC_MANAGER_ENUMERATE_SERVICE
         )
 
-        for service in statuses:
-            name = service['ServiceName']
-            display_name = service['DisplayName']
+        statuses = win32service.EnumServicesStatus(
+            scm_handle,
+            win32service.SERVICE_WIN32,
+            win32service.SERVICE_STATE_ALL
+        )
+
+        for (name, display_name, status) in statuses:
             try:
-                config = win32service.QueryServiceConfig(
-                    win32service.OpenService(scm_handle, name, win32con.SC_MANAGER_ALL_ACCESS)
-                )
+                svc_handle = win32service.OpenService(scm_handle, name, win32service.SC_MANAGER_ALL_ACCESS)
+                config = win32service.QueryServiceConfig(svc_handle)
+
                 start_type = decode_start_type(config[1])
                 logon_user = config[7]
                 binary_path = config[3]
-                status = "Running" if service['CurrentState'] == win32service.SERVICE_RUNNING else "Stopped"
+                current_state = "Running" if status[1] == win32service.SERVICE_RUNNING else "Stopped"
 
                 services.append({
                     "Service Name": name,
                     "Display Name": display_name,
-                    "Status": status,
+                    "Status": current_state,
                     "Start Type": start_type,
                     "Logon User": logon_user,
                     "Binary Path": binary_path
