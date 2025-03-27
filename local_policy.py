@@ -1,11 +1,42 @@
 import subprocess
 import os
 import tempfile
+import winreg
+import win32security
+import win32con
+
+
+def enable_se_debug_privilege():
+    """
+    Ensure the SeDebugPrivilege is enabled for the current process.
+    """
+    try:
+        # Open a handle to the current process
+        hproc = win32api.GetCurrentProcess()
+        proc_handle = win32security.OpenProcessToken(hproc, win32con.TOKEN_ADJUST_PRIVILEGES | win32con.TOKEN_QUERY)
+
+        # Enable SeDebugPrivilege
+        privs = win32security.AdjustTokenPrivileges(
+            proc_handle,
+            False,
+            [(win32security.LookupPrivilegeValue(None, "SeDebugPrivilege"), win32con.SE_PRIVILEGE_ENABLED)]
+        )
+        print("SeDebugPrivilege enabled.")
+    except Exception as e:
+        print(f"Failed to enable SeDebugPrivilege: {e}")
 
 
 def dump_local_security_policy():
     user_rights = {}
     audit_policy = {}
+
+    # Descriptions for each audit policy setting value
+    audit_value_descriptions = {
+        "0": "Disabled (No events will be logged)",
+        "1": "Success (Only successful events will be logged)",
+        "2": "Failure (Only failed events will be logged)",
+        "3": "Success and Failure (Both successful and failed events will be logged)"
+    }
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".inf") as tmpfile:
         inf_path = tmpfile.name
@@ -42,7 +73,8 @@ def dump_local_security_policy():
 
             if in_privileges and "=" in line:
                 key, val = line.strip().split("=", 1)
-                user_rights[key.strip()] = val.strip()
+                # Fix: split multiple SIDs or values properly into a list
+                user_rights[key.strip()] = [entry.strip() for entry in val.strip().split(",") if entry.strip()]
 
             if in_audit and "=" in line:
                 key, val = line.strip().split("=", 1)
@@ -51,11 +83,15 @@ def dump_local_security_policy():
     finally:
         os.remove(inf_path)
 
+    # Add descriptions for audit policy settings values
+    for key, value in audit_policy.items():
+        description = audit_value_descriptions.get(value, "Unknown")
+        audit_policy[key] = f"{value} - {description}"
+
     return {
         "User Rights Assignments": user_rights,
         "Audit Policy Settings": audit_policy
     }
-
 
 def get_password_policy():
     result = []
@@ -66,16 +102,53 @@ def get_password_policy():
         result.append(f"Error retrieving password policy: {e}")
     return result
 
+def detect_uac_misconfig():
+    uac_issues = []
+    key_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+
+    checks = {
+        "EnableLUA": (1, "UAC must be enabled (EnableLUA = 1)"),
+        "ConsentPromptBehaviorAdmin": (5, "Admin prompt should not be '0' (auto-elevate)"),
+        "PromptOnSecureDesktop": (1, "Secure Desktop must be enabled for elevation prompts"),
+    }
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+            for value_name, (expected, reason) in checks.items():
+                try:
+                    actual, _ = winreg.QueryValueEx(key, value_name)
+                    if actual != expected:
+                        uac_issues.append({
+                            "severity": "medium",
+                            "category": "UAC Misconfiguration",
+                            "description": f"{value_name} is {actual}, expected {expected}. {reason}"
+                        })
+                except FileNotFoundError:
+                    uac_issues.append({
+                        "severity": "medium",
+                        "category": "UAC Misconfiguration",
+                        "description": f"{value_name} not found in registry."
+                    })
+    except Exception as e:
+        uac_issues.append({
+            "severity": "high",
+            "category": "UAC Misconfiguration",
+            "description": f"Failed to access UAC registry settings: {e}"
+        })
+
+    return {"UAC Settings": uac_issues, "_risks": uac_issues}
 
 def run():
+    # Enable SeDebugPrivilege before running the policy checks
+    enable_se_debug_privilege()
+
     policy = dump_local_security_policy()
     policy["Password Policy"] = get_password_policy()
+    policy.update(detect_uac_misconfig())
     return policy
 
-
 def main():
-    dump_local_security_policy()
-    get_password_policy()
+    run()
 
 
 if __name__ == "__main__":
