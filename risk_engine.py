@@ -31,6 +31,9 @@ import ntsecuritycon
 import re
 import os
 import ctypes
+import win32security
+import win32net
+import win32netcon
 
 class RiskEngine:
     def __init__(self):
