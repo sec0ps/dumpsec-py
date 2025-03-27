@@ -191,13 +191,13 @@ def detect_hidden_tasks():
 
 def run():
     services, service_risks = get_services()
-    tasks = get_scheduled_tasks()
+    tasks, task_risks = get_scheduled_tasks()
     hidden = detect_hidden_tasks()
 
     results = {
         "Services": services,
         "Scheduled Tasks": tasks,
-        "_risks": service_risks
+        "_risks": service_risks + task_risks
     }
 
     results.update(hidden)
