@@ -1,5 +1,8 @@
 import win32net
 import win32netcon
+from risk_engine import RiskEngine
+
+risk = RiskEngine()
 
 def list_domain_trusts():
     trusts = []
@@ -16,7 +19,7 @@ def list_sessions():
     resume = 0
     try:
         while True:
-            results, total, resume = win32net.NetSessionEnum(None, None, None, 10, resume, 1000)
+            results, total, resume = win32net.NetSessionEnum(None, None, None, 10)
             for session in results:
                 sessions.append({
                     "User": session.get("user_name", ""),
@@ -34,7 +37,7 @@ def list_open_files():
     resume = 0
     try:
         while True:
-            results, total, resume = win32net.NetFileEnum(None, None, None, 3, resume, 1000)
+            results, total, resume = win32net.NetFileEnum(None, None, None, 3)
             for file in results:
                 open_files.append({
                     "File": file.get("path_name", ""),
@@ -48,10 +51,15 @@ def list_open_files():
 
 
 def run():
+    trusts = list_domain_trusts()
+    sessions = list_sessions()
+    open_files = list_open_files()
+
     return {
-        "Domain Trusts": list_domain_trusts(),
-        "Active Sessions": list_sessions(),
-        "Open Files": list_open_files()
+        "Domain Trusts": trusts,
+        "Active Sessions": sessions,
+        "Open Files": open_files,
+        "_risks": []  # Placeholder for future logic
     }
 
 
