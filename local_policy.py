@@ -34,7 +34,7 @@ import tempfile
 import winreg
 import win32security
 import win32con
-
+import win32api
 
 def enable_se_debug_privilege():
     """
