@@ -1,34 +1,6 @@
-# =============================================================================
-# DumpSec-Py - Windows Security Auditing Tool
-# =============================================================================
-#
-# Author: Keith Pachulski
-# Company: Red Cell Security, LLC
-# Email: keith@redcellsecurity.org
-# Website: www.redcellsecurity.org
-#
-# Copyright (c) 2025 Keith Pachulski. All rights reserved.
-#
-# License: This software is licensed under the MIT License.
-#          You are free to use, modify, and distribute this software
-#          in accordance with the terms of the license.
-#
-# Purpose: This script is part of the DumpSec-Py tool, which is designed to
-#          perform detailed security audits on Windows systems. It covers
-#          user rights, services, registry permissions, file/share permissions,
-#          group policy enumeration, risk assessments, and more.
-#
-# DISCLAIMER: This software is provided "as-is," without warranty of any kind,
-#             express or implied, including but not limited to the warranties
-#             of merchantability, fitness for a particular purpose, and non-infringement.
-#             In no event shall the authors or copyright holders be liable for any claim,
-#             damages, or other liability, whether in an action of contract, tort, or otherwise,
-#             arising from, out of, or in connection with the software or the use or other dealings
-#             in the software.
-#
-# =============================================================================
-
 import argparse
+import requests
+import os
 from datetime import datetime
 from report_writer import write_report
 from user_groups import run as run_user_groups
@@ -38,6 +10,24 @@ from services_tasks import run as run_services_tasks
 from local_policy import run as run_local_policy
 from domain_info import run as run_domain_info
 from watcher import monitor_changes
+
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/sec0ps/dumpsec-py/main/"
+GITHUB_VERSION_URL = GITHUB_RAW_BASE + "version.txt"
+LOCAL_VERSION_FILE = "version.txt"
+
+FILES_TO_UPDATE = [
+    "file_shares.py",
+    "risk_engine.py",
+    "services_tasks.py",
+    "domain_info.py",
+    "main.py",
+    "misc_audit.py",
+    "permisssions.py",
+    "registry_audit.py",
+    "report_writer.py",
+    "watcher.py",
+    "local_policy.py"
+]
 
 MODULES = {
     "1": ("Users and Groups", run_user_groups),
@@ -117,7 +107,58 @@ def interactive_menu():
         write_report(results, fmt, report_name, min_risk)
         print(f"[+] Saved {report_name}.{fmt}")
 
+def check_for_updates():
+    print("\n=== Checking for updates from GitHub... ===")
+    updated = False
+
+    try:
+        # Step 1: Read local version
+        local_version = "0.0.0"
+        if os.path.exists(LOCAL_VERSION_FILE):
+            with open(LOCAL_VERSION_FILE, "r") as f:
+                local_version = f.read().strip()
+
+        # Step 2: Get remote version
+        response = requests.get(GITHUB_VERSION_URL, timeout=5)
+        if response.status_code != 200:
+            print("[!] Could not retrieve remote version info (HTTP {}).".format(response.status_code))
+            print("=== Update check skipped ===\n")
+            return False
+
+        remote_version = response.text.strip()
+
+        # Step 3: Compare versions
+        if remote_version > local_version:
+            print(f"[+] New version detected: {remote_version} (current: {local_version})")
+            for filename in FILES_TO_UPDATE:
+                file_url = GITHUB_RAW_BASE + filename
+                file_resp = requests.get(file_url, timeout=10)
+                if file_resp.status_code == 200:
+                    with open(filename, "wb") as f:
+                        f.write(file_resp.content)
+                    print(f"    -> Updated {filename}")
+                else:
+                    print(f"    [!] Failed to update {filename} (HTTP {file_resp.status_code})")
+
+            # Step 4: Update local version record
+            with open(LOCAL_VERSION_FILE, "w") as f:
+                f.write(remote_version)
+
+            updated = True
+            print("[✓] Update complete. Please restart the tool to load latest changes.")
+        else:
+            print("[✓] Already running the latest version.")
+
+    except Exception as e:
+        print(f"[!] Update check failed: {e}")
+
+    print("=== Update check complete ===\n")
+    return updated
+
 def main():
+    # Check for updates before doing anything else
+    check_for_updates()
+
     args = parse_args()
 
     if args.watch:
