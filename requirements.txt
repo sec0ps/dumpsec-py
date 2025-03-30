@@ -1,3 +1,36 @@
-pywin32
-reportlab
-requests
+# =============================================================================
+# DumpSec-Py - Windows Security Auditing Tool - Updater Module
+# =============================================================================
+#
+# Author: Keith Pachulski
+# Company: Red Cell Security, LLC
+# Email: keith@redcellsecurity.org
+# Website: www.redcellsecurity.org
+#
+# Copyright (c) 2025 Keith Pachulski. All rights reserved.
+#
+# License: This software is licensed under the MIT License.
+#          You are free to use, modify, and distribute this software
+#          in accordance with the terms of the license.
+#
+# Purpose: This module provides update checking functionality for DumpSec-Py.
+#
+# DISCLAIMER: This software is provided "as-is," without warranty of any kind,
+#             express or implied, including but not limited to the warranties
+#             of merchantability, fitness for a particular purpose, and non-infringement.
+#
+# =============================================================================
+# Core dependencies
+pywin32>=300       # Windows API access
+requests>=2.25.0   # For update checking and API calls
+reportlab>=3.6.0   # For PDF report generation
+
+# Remote scanning dependencies
+paramiko>=2.7.2    # SSH client for remote scanning
+cryptography>=3.4.7 # Required by paramiko for cryptographic operations
+
+# GUI dependencies
+PyQt5>=5.15.4      # For graphical user interface
+
+# Analysis dependencies
+matplotlib>=3.5.0  # For generating charts in reports
