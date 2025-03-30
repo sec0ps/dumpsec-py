@@ -312,3 +312,47 @@ class RiskEngine:
             ))
     
         return findings
+
+    def calculate_risk_score(risks):
+        """Calculate an overall risk score based on findings."""
+        risk_weights = {
+            "low": 1,
+            "medium": 3,
+            "high": 5
+        }
+        
+        total_score = 0
+        max_possible = 0
+        
+        for risk in risks:
+            severity = risk.get("severity", "").lower()
+            if severity in risk_weights:
+                total_score += risk_weights[severity]
+                
+        # Calculate total findings count by severity
+        severity_counts = {
+            "low": 0,
+            "medium": 0,
+            "high": 0
+        }
+        
+        for risk in risks:
+            severity = risk.get("severity", "").lower()
+            if severity in severity_counts:
+                severity_counts[severity] += 1
+        
+        # Calculate maximum possible score (if all high)
+        max_possible = len(risks) * risk_weights["high"]
+        
+        # Normalize to 0-100 scale
+        normalized_score = (total_score / max_possible * 100) if max_possible > 0 else 0
+        
+        result = {
+            "score": round(normalized_score),
+            "findings": {
+                "total": len(risks),
+                "by_severity": severity_counts
+            }
+        }
+        
+        return result
