@@ -1,4 +1,4 @@
-# DumpSec-Py: Enhanced Windows Security Auditing Tool
+# DumpSec-Py: Enhanced Windows Security Auditing Tool (Community Edition)
 
 ## Overview
 DumpSec-Py is a Windows security auditing tool designed for security professionals, system administrators, and penetration testers. This enhanced version builds on the classic DumpSec functionality with modern security features supporting Windows 10/11 and Server 2019/2022 environments. The tool performs detailed security assessments across users, permissions, services, registry, policies, and more—providing actionable findings with risk-based prioritization.
