@@ -650,7 +650,7 @@ def main():
 /_____/\\__,_/_/ /_/ /_/\\__,_/_/\\__,_/ .___//_/    \\__, /  
                                    /_/           /____/   
                                    
- Windows Security Auditing Tool - v2.5.0
+ Windows Security Auditing Tool
  (c) 2025 Red Cell Security, LLC
 """)
         
