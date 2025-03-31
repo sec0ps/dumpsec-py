@@ -641,8 +641,15 @@ def main():
     """Main entry point for DumpSec-Py."""
     args = None  # Initialize args to avoid UnboundLocalError
     try:
+        # Load version from file
+        try:
+            with open('version.txt', 'r') as f:
+                version = f.read().strip()
+        except Exception:
+            version = "Unknown"
+
         # Print banner
-        print("""
+        print(f"""
     ____                      ____             ____       
    / __ \\__  ______ ___  ____/ / /___ _____   / __ \\__  __
   / / / / / / / __ `__ \\/ __  / / __ `/ __ \\ / /_/ / / / /
@@ -650,7 +657,7 @@ def main():
 /_____/\\__,_/_/ /_/ /_/\\__,_/_/\\__,_/ .___//_/    \\__, /  
                                    /_/           /____/   
                                    
- Windows Security Auditing Tool
+ Windows Security Auditing Tool v{version}
  (c) 2025 Red Cell Security, LLC
 """)
         
