@@ -1,5 +1,5 @@
 # =============================================================================
-# DumpSec-Py - Windows Security Auditing Tool (Container Audit Module)
+# DumpSec-Py - Windows Security Auditing Tool
 # =============================================================================
 #
 # Author: Keith Pachulski
@@ -14,1203 +14,705 @@
 #          in accordance with the terms of the license.
 #
 # Purpose: This script is part of the DumpSec-Py tool, which is designed to
-#          perform detailed security audits on Windows systems. This module
-#          specifically handles WSL and container security auditing.
+#          perform detailed security audits on Windows systems. It covers
+#          user rights, services, registry permissions, file/share permissions,
+#          group policy enumeration, risk assessments, and more.
+#
+# DISCLAIMER: This software is provided "as-is," without warranty of any kind,
+#             express or implied, including but not limited to the warranties
+#             of merchantability, fitness for a particular purpose, and non-infringement.
+#             In no event shall the authors or copyright holders be liable for any claim,
+#             damages, or other liability, whether in an action of contract, tort, or otherwise,
+#             arising from, out of, or in connection with the software or the use or other dealings
+#             in the software.
 #
 # =============================================================================
-
-import subprocess
-import json
+import argparse
+import requests
 import os
-import re
+from datetime import datetime
+import json
+import threading
+import queue
+import ipaddress
+import getpass
 import platform
-import time
-import signal
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from pathlib import Path
+import concurrent.futures
+from updater import check_for_updates
 
+# Import standard modules
+from report_writer import write_report
+from user_groups import run as run_user_groups
+from file_shares import run as run_file_shares
+from registry_audit import run as run_registry_audit
+from services_tasks import run as run_services_tasks
+from local_policy import run as run_local_policy
+from domain_info import run as run_domain_info
 
+# Import new modules
+from event_logs import run as run_event_logs
+from powershell_audit import run as run_powershell_audit
+from defender_atp import run as run_defender_atp
+from container_audit import check_wsl_status, check_wsl_and_container_security
+from compliance import run as run_compliance
+from remote_scanner import scan_multiple_hosts
+from watcher import monitor_changes
 
-def check_wsl_status():
-    """
-    Check WSL installation status and security posture.
-    Legacy function maintained for backward compatibility.
-    
-    Returns:
-        dict: Basic WSL status information with risk assessment
-    """
-    # Original function implementation
-    wsl_info = {}
-    risks = []
-    
-    try:
-        # Check if WSL is installed
-        output = subprocess.run(
-            ["wsl", "--status"],
-            capture_output=True, text=True
-        )
-        
-        if output.returncode != 0:
-            wsl_info["installed"] = False
-            return {"WSL Status": wsl_info, "_risks": risks}
-        
-        wsl_info["installed"] = True
-        
-        # Get list of distributions
-        output = subprocess.run(
-            ["wsl", "--list", "--verbose"],
-            capture_output=True, text=True
-        )
-        
-        if output.returncode == 0:
-            wsl_info["distributions"] = output.stdout.strip()
-            
-            # Check for WSL 1 distributions (less secure)
-            if "1" in output.stdout:
-                risks.append({
-                    "severity": "medium",
-                    "category": "WSL Security",
-                    "description": "WSL 1 distributions detected, which have weaker isolation than WSL 2"
-                })
-    except Exception as e:
-        wsl_info["error"] = str(e)
-    
-    # Check Docker Desktop/Windows Containers
-    try:
-        output = subprocess.run(
-            ["docker", "info", "--format", "{{json .}}"],
-            capture_output=True, text=True
-        )
-        
-        if output.returncode == 0:
-            docker_info = json.loads(output.stdout)
-            wsl_info["docker"] = {
-                "version": docker_info.get("ServerVersion", "Unknown"),
-                "isolation": docker_info.get("Isolation", "Unknown")
-            }
-            
-            # Check container isolation mode
-            if docker_info.get("Isolation", "").lower() != "hyperv":
-                risks.append({
-                    "severity": "high",
-                    "category": "Container Security",
-                    "description": "Docker containers not using Hyper-V isolation"
-                })
-    except Exception:
-        wsl_info["docker"] = "Not installed or not running"
-    
-    return {"WSL and Container Status": wsl_info, "_risks": risks}
+MODULES = {
+    "1": ("Users and Groups", run_user_groups),
+    "2": ("File and Share Permissions", run_file_shares),
+    "3": ("Registry Permissions", run_registry_audit),
+    "4": ("Services and Tasks", run_services_tasks),
+    "5": ("Local Security Policy", run_local_policy),
+    "6": ("Domain Trusts and Sessions", run_domain_info),
+}
 
-def _try_filesystem_detection(results):
-    """
-    Try to detect WSL distributions by checking for distribution data dynamically.
-    """
-    try:
-        print("Trying dynamic WSL distribution detection...")
-        
-        # Use PowerShell to get WSL distribution information from registry
-        ps_command = r'''
-        $wslDistros = @()
-        
-        # Check registry for WSL distributions
-        $lxssKey = "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss"
-        if (Test-Path $lxssKey) {
-            Get-ChildItem $lxssKey | ForEach-Object {
-                $distroKey = $_
-                $distroName = (Get-ItemProperty -Path $distroKey.PSPath -Name "DistributionName" -ErrorAction SilentlyContinue).DistributionName
-                $version = (Get-ItemProperty -Path $distroKey.PSPath -Name "Version" -ErrorAction SilentlyContinue).Version
-                if ($distroName) {
-                    $wslDistros += [PSCustomObject]@{
-                        Name = $distroName
-                        Version = if ($version -eq 2) { 2 } else { 1 }
-                    }
-                }
-            }
-        }
-        
-        # Also check system registry
-        $lxssKeySystem = "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss"
-        if (Test-Path $lxssKeySystem) {
-            Get-ChildItem $lxssKeySystem | ForEach-Object {
-                $distroKey = $_
-                $distroName = (Get-ItemProperty -Path $distroKey.PSPath -Name "DistributionName" -ErrorAction SilentlyContinue).DistributionName
-                $version = (Get-ItemProperty -Path $distroKey.PSPath -Name "Version" -ErrorAction SilentlyContinue).Version
-                if ($distroName) {
-                    # Only add if not already found
-                    $found = $false
-                    foreach ($d in $wslDistros) {
-                        if ($d.Name -eq $distroName) {
-                            $found = $true
-                            break
-                        }
-                    }
-                    if (-not $found) {
-                        $wslDistros += [PSCustomObject]@{
-                            Name = $distroName
-                            Version = if ($version -eq 2) { 2 } else { 1 }
-                        }
-                    }
-                }
-            }
-        }
-        
-        # If no distributions found through registry, try running wsl command
-        if ($wslDistros.Count -eq 0) {
-            try {
-                $output = & wsl.exe --list
-                $lines = $output -split "`n"
-                foreach ($line in $lines) {
-                    $line = $line.Trim()
-                    if ($line -and -not $line.StartsWith("Windows") -and $line -ne "") {
-                        $name = $line -replace "\\(Default\\)", "" 
-                        $name = $name.Trim()
-                        $wslDistros += [PSCustomObject]@{
-                            Name = $name
-                            Version = 2  # Assume WSL 2
-                        }
-                    }
-                }
-            } catch {
-                Write-Output "Error running wsl --list: $_"
-            }
-        }
-        
-        $wslDistros | ConvertTo-Json
-        '''
-        
-        cmd = ["powershell", "-Command", ps_command]
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        
-        if output.returncode == 0 and output.stdout.strip():
-            try:
-                # Parse the JSON output
-                distro_data = json.loads(output.stdout.strip())
-                
-                # Convert to array if single object
-                if isinstance(distro_data, dict):
-                    distro_data = [distro_data]
-                
-                # Add each distribution
-                for distro in distro_data:
-                    distro_name = distro.get("Name", "")
-                    if distro_name and not "\u0000" in distro_name:
-                        results["wsl"]["distributions"].append({
-                            "name": distro_name,
-                            "state": "Unknown",  # Can't determine state from registry
-                            "version": int(distro.get("Version", 2))  # Default to WSL 2
-                        })
-                
-                # If we found distributions, add a finding
-                if results["wsl"]["distributions"]:
-                    results["findings"].append({
-                        "severity": "info",
-                        "category": "WSL Detection",
-                        "description": "WSL distributions were detected. Some security checks may be limited.",
-                        "remediation": "Ensure WSL is properly configured for security."
-                    })
-            except json.JSONDecodeError:
-                print("Failed to parse PowerShell output as JSON")
-    except Exception as e:
-        print(f"Error in WSL detection: {str(e)}")
+OUTPUT_FORMATS = ["txt", "json", "pdf", "html", "csv", "all"]
+RISK_LEVELS = ["low", "medium", "high"]
 
-def _check_wsl_distro_security(distro_name, target_system=None, credentials=None):
-    """
-    Check security configuration of a specific WSL distribution.
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="DumpSec-Py - Windows Security Auditor")
     
-    Args:
-        distro_name (str): Name of the WSL distribution
-        target_system (str): Remote system to audit (None for local)
-        credentials (dict): Authentication details for remote access
-        
-    Returns:
-        dict: Security findings for the specified distribution
-    """
-    results = {
-        "distribution": distro_name,
-        "findings": [],
-        "security_data": {}
-    }
+    # Output options
+    output_group = parser.add_argument_group("Output Options")
+    output_group.add_argument("--output-format", choices=["txt", "json", "pdf", "html", "csv", "all"], 
+                             help="Output format: txt, json, pdf, html, csv, all")
+    output_group.add_argument("--output-file", help="Output filename (without extension)")
+    output_group.add_argument("--risk-level", choices=["low", "medium", "high"], 
+                             help="Minimum risk severity to include in report")
     
-    # Validate distribution name
-    if not distro_name or "\u0000" in distro_name:
-        print(f"Invalid distro name: {repr(distro_name)}")
-        return results
+    # Scan modes
+    mode_group = parser.add_argument_group("Scan Modes")
+    mode_group.add_argument("--watch", action="store_true", help="Enable real-time monitoring mode")
+    mode_group.add_argument("--compare", nargs=2, metavar=("OLD_REPORT", "NEW_REPORT"), 
+                          help="Compare two previous reports")
+    mode_group.add_argument("--remote", action="store_true", help="Scan remote hosts")
+    # Add the missing GUI parameter
+    mode_group.add_argument("--gui", action="store_true", help="Launch graphical user interface")
     
-    # Simple check to see if distribution is running
-    print(f"Testing if {distro_name} responds...")
-    try:
-        cmd = ["wsl", "-d", distro_name, "--exec", "echo", "WSL_TEST_OK"]
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        
-        if output.returncode == 0 and "WSL_TEST_OK" in output.stdout:
-            print(f"✓ Distribution {distro_name} is responsive")
-            results["security_data"]["status"] = "Running"
-        else:
-            print(f"✗ Distribution {distro_name} is not responsive")
-            results["security_data"]["status"] = "Not responding"
-            results["findings"].append({
-                "severity": "info",
-                "category": "WSL Status",
-                "description": f"Distribution '{distro_name}' is not currently running or responsive",
-                "remediation": "Start the distribution to perform security checks"
-            })
-            return results
-    except Exception as e:
-        print(f"! Error testing distribution {distro_name}: {str(e)}")
-        results["findings"].append({
-            "severity": "error",
-            "category": "WSL Status",
-            "description": f"Error testing WSL distribution: {str(e)}"
-        })
-        return results
+    # Remote scanning options
+    remote_group = parser.add_argument_group("Remote Scanning Options")
+    remote_group.add_argument("--hosts", help="List of hosts to scan (comma-separated or file)")
+    remote_group.add_argument("--username", help="Username for remote authentication")
+    remote_group.add_argument("--key-file", help="SSH private key for remote authentication")
+    remote_group.add_argument("--max-threads", type=int, default=5, help="Maximum parallel scans")
     
-    # Check for sensitive mounts
-    try:
-        print(f"Checking mounts for {distro_name}...")
-        wsl_command = f"mount | grep -E '/mnt/[cd]|/mnt/host' || echo 'No system mounts found'"
-        
-        if target_system:
-            cmd = _create_remote_command(
-                ["wsl", "-d", distro_name, "bash", "-c", f"'{wsl_command}'"],
-                target_system, credentials
-            )
-        else:
-            cmd = ["wsl", "-d", distro_name, "bash", "-c", wsl_command]
-            
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        
-        if output.returncode == 0 and "No system mounts found" not in output.stdout:
-            results["findings"].append({
-                "severity": "high",
-                "category": "WSL File System",
-                "description": "System drives automatically mounted in WSL, presenting potential data exfiltration risk",
-                "remediation": "Consider unmounting sensitive drives or restricting access",
-                "compliance": ["CIS 1.1.3"]
-            })
-    except Exception as e:
-        print(f"Error checking WSL mounts for {distro_name}: {str(e)}")
-        results["findings"].append({
-            "severity": "error",
-            "category": "WSL Mounts",
-            "description": f"Error checking WSL mounts: {str(e)}"
-        })
+    # Module selection
+    module_group = parser.add_argument_group("Module Selection")
+    module_group.add_argument("--modules", help="Modules to run (comma-separated: users,shares,registry,services,policy,domain,events,powershell,defender,containers)")
     
-    # Check for privileged users
-    try:
-        print(f"Checking privileged users for {distro_name}...")
-        wsl_command = "grep -E '^sudo|^wheel' /etc/group | cut -d: -f4 || echo 'No sudo users found'"
-        
-        if target_system:
-            cmd = _create_remote_command(
-                ["wsl", "-d", distro_name, "bash", "-c", f"'{wsl_command}'"],
-                target_system, credentials
-            )
-        else:
-            cmd = ["wsl", "-d", distro_name, "bash", "-c", wsl_command]
-            
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        
-        if output.returncode == 0 and "No sudo users found" not in output.stdout and output.stdout.strip():
-            sudo_users = output.stdout.strip().split(',')
-            if len(sudo_users) > 1:
-                results["findings"].append({
-                    "severity": "medium",
-                    "category": "WSL Privileges",
-                    "description": f"Multiple users ({len(sudo_users)}) have sudo privileges in WSL distribution",
-                    "remediation": "Limit privileged access to required users only",
-                    "compliance": ["CIS 1.1.5"]
-                })
-    except Exception as e:
-        print(f"Error checking WSL privileged users for {distro_name}: {str(e)}")
-        results["findings"].append({
-            "severity": "error",
-            "category": "WSL Users",
-            "description": f"Error checking WSL privileged users: {str(e)}"
-        })
+    # Feature flags
+    feature_group = parser.add_argument_group("Feature Flags")
+    feature_group.add_argument("--scan-event-logs", action="store_true", help="Include Windows Event Log analysis")
+    feature_group.add_argument("--scan-powershell", action="store_true", help="Include PowerShell security audit")
+    feature_group.add_argument("--scan-defender", action="store_true", help="Include Windows Defender/ATP analysis")
+    feature_group.add_argument("--scan-containers", action="store_true", help="Include WSL/Container security audit")
+    feature_group.add_argument("--map-compliance", action="store_true", help="Map findings to compliance frameworks")
     
-    # Check for exposed network services
-    try:
-        print(f"Checking network services for {distro_name}...")
-        wsl_command = "netstat -tuln | grep 'LISTEN' | grep -v '127.0.0.1' | grep -v '::1' || echo 'No exposed services found'"
-        
-        if target_system:
-            cmd = _create_remote_command(
-                ["wsl", "-d", distro_name, "bash", "-c", f"'{wsl_command}'"],
-                target_system, credentials
-            )
-        else:
-            cmd = ["wsl", "-d", distro_name, "bash", "-c", wsl_command]
-            
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        
-        if output.returncode == 0 and "No exposed services found" not in output.stdout and output.stdout.strip():
-            service_count = len(output.stdout.strip().split('\n'))
-            if service_count > 0:
-                results["findings"].append({
-                    "severity": "high",
-                    "category": "WSL Network",
-                    "description": f"{service_count} network services exposed beyond localhost in WSL distribution",
-                    "remediation": "Configure services to listen only on localhost or restrict with firewall",
-                    "compliance": ["CIS 1.1.6", "NIST SP 800-190"]
-                })
-    except Exception as e:
-        print(f"Error checking WSL network services for {distro_name}: {str(e)}")
-        results["findings"].append({
-            "severity": "error",
-            "category": "WSL Network",
-            "description": f"Error checking WSL network services: {str(e)}"
-        })
+    # Debug options
+    debug_group = parser.add_argument_group("Debug Options")
+    debug_group.add_argument("--debug", action="store_true", help="Enable debug output")
     
-    # Check for container engines within WSL
-    try:
-        print(f"Checking container engines for {distro_name}...")
-        wsl_command = "command -v docker podman containerd cri-o >/dev/null && echo 'Container engine found' || echo 'No container engine found'"
-        
-        if target_system:
-            cmd = _create_remote_command(
-                ["wsl", "-d", distro_name, "bash", "-c", f"'{wsl_command}'"],
-                target_system, credentials
-            )
-        else:
-            cmd = ["wsl", "-d", distro_name, "bash", "-c", wsl_command]
-            
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        
-        if output.returncode == 0 and "Container engine found" in output.stdout:
-            results["findings"].append({
-                "severity": "medium",
-                "category": "WSL Containers",
-                "description": "Container engine detected within WSL distribution, creating nested container scenario",
-                "remediation": "Consider security implications of nested containers and potential privilege escalation",
-                "compliance": ["NIST SP 800-190"]
-            })
-    except Exception as e:
-        print(f"Error checking for container engines in WSL for {distro_name}: {str(e)}")
-        results["findings"].append({
-            "severity": "error",
-            "category": "WSL Containers",
-            "description": f"Error checking for container engines in WSL: {str(e)}"
-        })
-    
-    return results
+    return parser.parse_args()
 
-def check_wsl_and_container_security(target_system=None, credentials=None):
-    """
-    Comprehensive WSL and container security audit with enhanced detection capabilities.
+def get_all_modules():
+    """Get all available audit modules."""
+    modules = {}
     
-    Args:
-        target_system (str): Remote system to audit (None for local)
-        credentials (dict): Authentication details for remote access
-        
-    Returns:
-        dict: Detailed WSL and container security findings with risk assessments
-    """
-    # Start time for performance tracking
-    start_time = time.time()
-    
-    results = {
-        "wsl": {
-            "installed": False,
-            "version": None,
-            "distributions": [],
-            "security_settings": {}
-        },
-        "containers": {
-            "docker_desktop": {
-                "installed": False,
-                "version": None,
-                "isolation": None,
-                "settings": {}
-            },
-            "windows_containers": {
-                "enabled": False,
-                "isolation": None
-            },
-            "podman": {
-                "installed": False,
-                "version": None
-            }
-        },
-        "integration": {
-            "kubernetes": False,
-            "docker_compose": False
-        },
-        "findings": [],
-        "compliance": {
-            "cis": [],
-            "nist": []
-        }
-    }
-    
-    # Check if running on Windows
-    if platform.system() != "Windows" and not target_system:
-        results["findings"].append({
-            "severity": "info",
-            "category": "Environment",
-            "description": "Audit running from non-Windows system without remote target specified"
-        })
-    
-    # WSL version and status check
+    # Standard modules
     try:
-        print("Checking WSL installation status...")
-        cmd = ["wsl", "--status"]
-        if target_system:
-            # Use remote PowerShell execution for remote systems
-            cmd = _create_remote_command(cmd, target_system, credentials)
-            
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        
-        if output.returncode == 0:
-            results["wsl"]["installed"] = True
-            
-            # Extract WSL version information
-            version_match = re.search(r"WSL version: (\d+\.\d+\.\d+)", output.stdout)
-            if version_match:
-                results["wsl"]["version"] = version_match.group(1)
-            
-            # Check kernel version
-            kernel_match = re.search(r"Kernel version: (\d+\.\d+\.\d+)", output.stdout)
-            if kernel_match:
-                results["wsl"]["security_settings"]["kernel_version"] = kernel_match.group(1)
-                
-                # Check if kernel is outdated (example threshold)
-                kernel_version = kernel_match.group(1).split('.')
-                if int(kernel_version[0]) < 5 or (int(kernel_version[0]) == 5 and int(kernel_version[1]) < 10):
-                    results["findings"].append({
-                        "severity": "medium",
-                        "category": "WSL Security",
-                        "description": f"Outdated WSL kernel version {kernel_match.group(1)} may contain security vulnerabilities",
-                        "remediation": "Update WSL with 'wsl --update'",
-                        "compliance": ["CIS 1.1.2", "NIST SP 800-190"]
-                    })
-        else:
-            # Check if WSL is installed but disabled
-            print("WSL status check failed, checking Windows features...")
-            wsl_components = _check_windows_features(["Microsoft-Windows-Subsystem-Linux"], target_system, credentials)
-            if wsl_components.get("Microsoft-Windows-Subsystem-Linux", False):
-                results["wsl"]["installed"] = True
-                results["wsl"]["enabled"] = False
-                
-                results["findings"].append({
-                    "severity": "info",
-                    "category": "WSL Status",
-                    "description": "WSL is installed but may be disabled or not properly configured"
-                })
-    except Exception as e:
-        print(f"Error checking WSL status: {str(e)}")
-        results["findings"].append({
-            "severity": "error",
-            "category": "WSL Detection",
-            "description": f"Error checking WSL status: {str(e)}"
-        })
+        from user_groups import run as run_user_groups
+        modules["users"] = ("Users and Groups", run_user_groups)
+    except ImportError:
+        print("[!] Warning: user_groups module not found")
     
-    # Detect WSL distributions
-    if results["wsl"]["installed"]:
+    try:
+        from file_shares import run as run_file_shares
+        modules["shares"] = ("File and Share Permissions", run_file_shares)
+    except ImportError:
+        print("[!] Warning: file_shares module not found")
+    
+    try:
+        from registry_audit import run as run_registry_audit
+        modules["registry"] = ("Registry Permissions", run_registry_audit)
+    except ImportError:
+        print("[!] Warning: registry_audit module not found")
+    
+    try:
+        from services_tasks import run as run_services_tasks
+        modules["services"] = ("Services and Tasks", run_services_tasks)
+    except ImportError:
+        print("[!] Warning: services_tasks module not found")
+    
+    try:
+        from local_policy import run as run_local_policy
+        modules["policy"] = ("Local Security Policy", run_local_policy)
+    except ImportError:
+        print("[!] Warning: local_policy module not found")
+    
+    try:
+        from domain_info import run as run_domain_info
+        modules["domain"] = ("Domain Trusts and Sessions", run_domain_info)
+    except ImportError:
+        print("[!] Warning: domain_info module not found")
+    
+    # Enhanced modules
+    try:
+        from event_logs import run as run_event_logs
+        modules["events"] = ("Windows Event Logs", run_event_logs)
+    except ImportError:
+        print("[!] Warning: event_logs module not found or not yet implemented")
+    
+    try:
+        from powershell_audit import run as run_powershell_audit
+        modules["powershell"] = ("PowerShell Security", run_powershell_audit)
+    except ImportError:
+        print("[!] Warning: powershell_audit module not found or not yet implemented")
+    
+    try:
+        from defender_atp import run as run_defender_atp
+        modules["defender"] = ("Windows Defender/ATP", run_defender_atp)
+    except ImportError:
+        print("[!] Warning: defender_atp module not found or not yet implemented")
+    
+    try:
+        from container_audit import check_wsl_and_container_security
+        modules["containers"] = ("WSL and Container Security", check_wsl_and_container_security)
+    except ImportError:
         try:
-            print("Checking for WSL distributions...")
-            # Try to get distributions with basic command
-            cmd = ["wsl", "-l"]
-            output = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            
-            if output.returncode == 0:
-                # Simple parsing of output
-                output_lines = output.stdout.strip().split('\n')
-                
-                # Skip the header line if it exists
-                start_idx = 0
-                for i, line in enumerate(output_lines):
-                    if "Windows Subsystem for Linux Distributions:" in line:
-                        start_idx = i + 1
-                        break
-                
-                # Process each distribution line
-                for i in range(start_idx, len(output_lines)):
-                    line = output_lines[i].strip()
-                    if not line:
-                        continue
-                        
-                    # Handle possible "(Default)" marker
-                    distro_name = line.replace("(Default)", "").strip()
-                    
-                    # Skip lines with null characters
-                    if "\u0000" in distro_name:
-                        continue
-                        
-                    # Add to our list
-                    results["wsl"]["distributions"].append({
-                        "name": distro_name,
-                        "state": "Unknown",
-                        "version": 2  # Default to WSL 2
-                    })
-            
-            # If we didn't find any distributions, try PowerShell approach
-            if not results["wsl"]["distributions"]:
-                print("Basic approach failed, trying PowerShell approach...")
-                _try_filesystem_detection(results)
-        except Exception as e:
-            print(f"Error detecting WSL distributions: {str(e)}")
-            results["findings"].append({
-                "severity": "error",
-                "category": "WSL Distributions",
-                "description": f"Error enumerating WSL distributions: {str(e)}"
-            })
+            # Fallback to original function if enhanced one isn't available
+            from container_audit import check_wsl_status
+            modules["containers"] = ("WSL and Container Security", check_wsl_status)
+        except ImportError:
+            print("[!] Warning: container_audit module not found or not yet implemented")
     
-    # Check WSL distro security configurations
-    if results["wsl"]["distributions"]:
-        print(f"Found {len(results['wsl']['distributions'])} WSL distributions, checking security...")
-        
-        # Process each distribution sequentially for reliability
-        for distro in results["wsl"]["distributions"]:
-            try:
-                print(f"Checking security for {distro['name']}...")
-                distro_results = _check_wsl_distro_security(distro["name"])
-                
-                # Add distribution-specific findings to main results
-                if "findings" in distro_results:
-                    for finding in distro_results["findings"]:
-                        finding["distro"] = distro["name"]
-                        results["findings"].append(finding)
-                
-                # Add security data to distribution info
-                if "security_data" in distro_results:
-                    distro["security_data"] = distro_results["security_data"]
-            except Exception as e:
-                print(f"Error during security check for {distro['name']}: {str(e)}")
-                results["findings"].append({
-                    "severity": "error",
-                    "category": "WSL Security",
-                    "description": f"Error performing security checks for {distro['name']}: {str(e)}",
-                    "distro": distro["name"]
-                })
+    return modules
+
+def select_modules(args):
+    """Select which modules to run based on command line arguments."""
+    all_modules = get_all_modules()
+    selected_modules = {}
+    
+    if args.modules:
+        module_list = args.modules.split(',')
+        for module in module_list:
+            if module in all_modules:
+                selected_modules[module] = all_modules[module]
     else:
-        # No distributions found
-        if results["wsl"]["installed"]:
-            results["findings"].append({
-                "severity": "info",
-                "category": "WSL Configuration",
-                "description": "WSL is installed but no distributions were detected"
-            })
+        # Default modules
+        for module in ["users", "shares", "registry", "services", "policy", "domain"]:
+            selected_modules[module] = all_modules[module]
+        
+        # Optional modules based on flags
+        if args.scan_event_logs:
+            selected_modules["events"] = all_modules["events"]
+        
+        if args.scan_powershell:
+            selected_modules["powershell"] = all_modules["powershell"]
+        
+        if args.scan_defender:
+            selected_modules["defender"] = all_modules["defender"]
+        
+        if args.scan_containers:
+            selected_modules["containers"] = all_modules["containers"]
     
-    # Docker Desktop checks
-    try:
-        print("Checking Docker Desktop installation...")
-        docker_path = "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe"
-        if target_system:
-            # Check for Docker Desktop installation remotely
-            cmd = _create_remote_command(
-                ["powershell", "-Command", f"Test-Path '{docker_path}'"],
-                target_system, credentials
-            )
+    return selected_modules
+
+def cli_mode(args):
+    """Run in command-line mode with specified arguments."""
+    report_name = args.output_file or f"dumpsec_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    fmt_display = args.output_format.upper() if args.output_format != "all" else "ALL FORMATS"
+    print(f"[*] Running DumpSec audit in {fmt_display} mode...\n")
+
+    # Get selected modules
+    modules = select_modules(args)
+    
+    results = {}
+    all_risks = []
+    
+    for key, (label, func) in modules.items():
+        print(f"[{key}] Running {label}...")
+        module_results = func()
+        results[label] = module_results
+        
+        # Collect risks for compliance mapping
+        if isinstance(module_results, dict) and "_risks" in module_results:
+            all_risks.extend(module_results["_risks"])
+    
+    # Map findings to compliance frameworks if requested
+    if args.map_compliance:
+        print("[*] Mapping findings to compliance frameworks...")
+        compliance_report = run_compliance(all_risks)
+        results["Compliance Mapping"] = compliance_report
+    
+    # Write report
+    write_report(results, args.output_format, report_name, args.risk_level)
+
+    if args.output_format == "all":
+        print(f"[+] Reports saved as {report_name}.txt, .json, .pdf, .html, and .csv")
+    else:
+        print(f"[+] Report saved as {report_name}.{args.output_format}")
+        
+def compare_reports(args):
+    """Compare two existing reports to identify changes."""
+    from report_writer import compare_reports
+    
+    old_report = args.compare[0]
+    new_report = args.compare[1]
+    
+    if not os.path.exists(old_report) or not os.path.exists(new_report):
+        print(f"[!] One or both report files not found")
+        return
+    
+    print(f"[*] Comparing reports: {old_report} vs {new_report}")
+    
+    differences = compare_reports(old_report, new_report)
+    output_file = f"diff_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    
+    with open(output_file, "w") as f:
+        json.dump(differences, f, indent=2)
+    
+    print(f"[+] Comparison report saved as {output_file}")
+    
+    # Print summary
+    added = sum(len(v) for v in differences["added"].values())
+    removed = sum(len(v) for v in differences["removed"].values())
+    modified = sum(len(v) for v in differences["modified"].values())
+    
+    print(f"\nSummary of changes:")
+    print(f"  - Added: {added} items")
+    print(f"  - Removed: {removed} items")
+    print(f"  - Modified: {modified} items")
+
+def remote_mode(args):
+    """Scan remote Windows hosts."""
+    if not args.hosts:
+        print("[!] No hosts specified. Use --hosts option.")
+        return
+    
+    # Get hosts list
+    if os.path.exists(args.hosts):
+        with open(args.hosts, 'r') as f:
+            hosts = [line.strip() for line in f if line.strip()]
+    else:
+        hosts = [h.strip() for h in args.hosts.split(',') if h.strip()]
+    
+    if not hosts:
+        print("[!] No valid hosts found.")
+        return
+    
+    # Get credentials
+    username = args.username
+    if not username:
+        username = input("Enter username for remote authentication: ")
+    
+    password = None
+    if not args.key_file:
+        password = getpass.getpass("Enter password (leave empty to use SSH key): ")
+        if not password:
+            key_file = input("Enter path to SSH private key: ")
         else:
-            # Local check
-            cmd = ["powershell", "-Command", f"Test-Path '{docker_path}'"]
-            
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        
-        if output.returncode == 0 and "True" in output.stdout:
-            results["containers"]["docker_desktop"]["installed"] = True
-            
-            # Get Docker version and settings
-            docker_cmd = [docker_path, "info", "--format", "{{json .}}"]
-            if target_system:
-                docker_cmd = _create_remote_command(docker_cmd, target_system, credentials)
-                
-            docker_output = subprocess.run(docker_cmd, capture_output=True, text=True, timeout=15)
-            
-            if docker_output.returncode == 0:
-                try:
-                    docker_info = json.loads(docker_output.stdout)
-                    results["containers"]["docker_desktop"]["version"] = docker_info.get("ServerVersion", "Unknown")
-                    results["containers"]["docker_desktop"]["isolation"] = docker_info.get("Isolation", "Unknown")
-                    
-                    # Security checks
-                    if docker_info.get("Isolation", "").lower() != "hyperv":
-                        results["findings"].append({
-                            "severity": "high",
-                            "category": "Container Security",
-                            "description": "Docker Desktop not using Hyper-V isolation, which reduces container security boundaries",
-                            "remediation": "Enable Hyper-V isolation in Docker Desktop settings",
-                            "compliance": ["CIS 2.8", "NIST SP 800-190"]
-                        })
-                    
-                    # Check for insecure container configurations
-                    security_options = docker_info.get("SecurityOptions", [])
-                    if not any("selinux" in opt.lower() for opt in security_options) and \
-                       not any("apparmor" in opt.lower() for opt in security_options):
-                        results["findings"].append({
-                            "severity": "medium",
-                            "category": "Container Security",
-                            "description": "No advanced Linux security modules (AppArmor/SELinux) detected for Docker containers",
-                            "remediation": "Enable security profiles for containers",
-                            "compliance": ["CIS 2.6", "NIST SP 800-190"]
-                        })
-                    
-                    # Check for running containers
-                    docker_ps_cmd = [docker_path, "ps", "--format", "{{json .}}"]
-                    if target_system:
-                        docker_ps_cmd = _create_remote_command(docker_ps_cmd, target_system, credentials)
-                        
-                    ps_output = subprocess.run(docker_ps_cmd, capture_output=True, text=True, timeout=10)
-                    
-                    if ps_output.returncode == 0 and ps_output.stdout.strip():
-                        container_count = len(ps_output.stdout.strip().split('\n'))
-                        results["containers"]["docker_desktop"]["running_containers"] = container_count
-                        
-                        if container_count > 0:
-                            results["findings"].append({
-                                "severity": "info",
-                                "category": "Container Usage",
-                                "description": f"{container_count} running containers detected",
-                                "remediation": "Audit container permissions and mounted volumes for security risks"
-                            })
-                except json.JSONDecodeError:
-                    results["findings"].append({
-                        "severity": "error",
-                        "category": "Docker Info",
-                        "description": "Failed to parse Docker information output"
-                    })
-    except Exception as e:
-        print(f"Error checking Docker Desktop status: {str(e)}")
-        results["findings"].append({
-            "severity": "error",
-            "category": "Docker Detection",
-            "description": f"Error checking Docker Desktop status: {str(e)}"
-        })
+            key_file = None
+    else:
+        key_file = args.key_file
     
-    # Windows native container feature
-    try:
-        print("Checking Windows Container features...")
-        container_features = _check_windows_features(
-            ["Containers", "Microsoft-Hyper-V", "Microsoft-Hyper-V-All"],
-            target_system, credentials
-        )
-        
-        if container_features.get("Containers", False):
-            results["containers"]["windows_containers"]["enabled"] = True
-            
-            # Check isolation mode
-            if container_features.get("Microsoft-Hyper-V", False) or container_features.get("Microsoft-Hyper-V-All", False):
-                results["containers"]["windows_containers"]["isolation"] = "hyperv"
-            else:
-                results["containers"]["windows_containers"]["isolation"] = "process"
-                results["findings"].append({
-                    "severity": "high",
-                    "category": "Windows Containers",
-                    "description": "Windows Containers enabled without Hyper-V, using less secure process isolation",
-                    "remediation": "Enable Hyper-V feature for container isolation",
-                    "compliance": ["CIS 2.8", "NIST SP 800-190"]
-                })
-    except Exception as e:
-        print(f"Error checking Windows Container features: {str(e)}")
-        results["findings"].append({
-            "severity": "error",
-            "category": "Windows Containers",
-            "description": f"Error checking Windows Container features: {str(e)}"
-        })
+    print(f"[*] Scanning {len(hosts)} remote hosts with {args.max_threads} parallel threads")
+    results = scan_multiple_hosts(hosts, username, password, key_file, args.max_threads)
     
-    # Check for container orchestration
+    # Save results
+    output_file = args.output_file or f"remote_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(f"{output_file}.json", "w") as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"[+] Remote scan results saved as {output_file}.json")
+    
+    # Print summary
+    print("\nScan summary:")
+    for host, result in results.items():
+        if "analysis" in result and "risks" in result["analysis"]:
+            risks = result["analysis"]["risks"]
+            high = sum(1 for r in risks if r.get("severity") == "high")
+            medium = sum(1 for r in risks if r.get("severity") == "medium")
+            low = sum(1 for r in risks if r.get("severity") == "low")
+            print(f"  - {host}: {len(risks)} findings (High: {high}, Medium: {medium}, Low: {low})")
+        else:
+            print(f"  - {host}: Scan failed or no findings")
+
+def interactive_menu():
+    """Run in interactive menu mode."""
     try:
-        print("Checking for container orchestration...")
-        # Kubernetes check
-        k8s_paths = [
-            "C:\\Program Files\\Kubernetes\\",
-            f"{os.environ.get('USERPROFILE', 'C:\\Users\\Default')}\\AppData\\Local\\Microsoft\\WindowsApps\\kubectl.exe"
-        ]
-        
-        for path in k8s_paths:
-            if target_system:
-                cmd = _create_remote_command(
-                    ["powershell", "-Command", f"Test-Path '{path}'"],
-                    target_system, credentials
-                )
-            else:
-                cmd = ["powershell", "-Command", f"Test-Path '{path}'"]
-                
-            output = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        while True:
+            print("\n==== DumpSec-Py Interactive Menu ====")
+            print("1. Run Standard Security Audit")
+            print("2. Run Advanced Security Audit (includes Event Logs, PowerShell, Defender)")
+            print("3. Scan Remote Windows Systems")
+            print("4. Run Real-time Change Monitoring")
+            print("5. Compare Previous Reports")
+            print("6. Exit")
+
+            choice = input("\nEnter your choice (1-6): ").strip()
             
-            if output.returncode == 0 and "True" in output.stdout:
-                results["integration"]["kubernetes"] = True
-                results["findings"].append({
-                    "severity": "info",
-                    "category": "Container Orchestration",
-                    "description": "Kubernetes tooling detected, additional security considerations apply",
-                    "remediation": "Ensure RBAC is properly configured for Kubernetes deployments"
-                })
+            if choice == "1":
+                run_standard_audit()
+            elif choice == "2":
+                run_advanced_audit()
+            elif choice == "3":
+                run_remote_scan()
+            elif choice == "4":
+                print("\n[*] Starting real-time change monitoring...")
+                monitor_changes()
+            elif choice == "5":
+                run_report_comparison()
+            elif choice == "6":
+                print("Exiting. Goodbye!")
                 break
-        
-        # Docker Compose check
-        if target_system:
-            cmd = _create_remote_command(
-                ["powershell", "-Command", "Get-ChildItem -Path $env:USERPROFILE -Filter docker-compose.yml -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName"],
-                target_system, credentials
-            )
-        else:
-            cmd = ["powershell", "-Command", "Get-ChildItem -Path $env:USERPROFILE -Filter docker-compose.yml -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName"]
-            
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        
-        if output.returncode == 0 and output.stdout.strip():
-            results["integration"]["docker_compose"] = True
-            results["findings"].append({
-                "severity": "info",
-                "category": "Container Orchestration",
-                "description": "Docker Compose configuration detected, consider reviewing for security configurations",
-                "remediation": "Ensure sensitive data is not stored in compose files and networks are properly segmented"
-            })
-    except Exception as e:
-        print(f"Error checking container orchestration: {str(e)}")
-        results["findings"].append({
-            "severity": "error",
-            "category": "Container Orchestration",
-            "description": f"Error checking container orchestration: {str(e)}"
-        })
+            else:
+                print("[!] Invalid choice. Please enter a number between 1 and 6.")
     
-    # Map findings to compliance frameworks
-    print("Mapping findings to compliance frameworks...")
-    for finding in results["findings"]:
-        if "compliance" in finding:
-            for compliance_id in finding["compliance"]:
-                if compliance_id.startswith("CIS"):
-                    results["compliance"]["cis"].append({
-                        "id": compliance_id,
-                        "finding": finding["description"],
-                        "severity": finding["severity"]
-                    })
-                elif compliance_id.startswith("NIST"):
-                    results["compliance"]["nist"].append({
-                        "id": compliance_id,
-                        "finding": finding["description"],
-                        "severity": finding["severity"]
-                    })
-    
-    # Record execution time for performance tracking
-    end_time = time.time()
-    execution_time = end_time - start_time
-    print(f"Container audit completed in {execution_time:.2f} seconds")
-    
-    return results
+    except KeyboardInterrupt:
+        print("\n[!] Keyboard interrupt received. Exiting gracefully.")
 
-def _try_registry_detection(results, target_system=None, credentials=None):
-    """
-    Try to detect WSL distributions via registry query if other methods fail.
+def check_windows_version():
+    """Check Windows version and return compatibility information."""
+    import platform
+    win_ver = platform.win32_ver()
     
-    Args:
-        results (dict): Results dictionary to update
-        target_system (str): Remote system to audit (None for local)
-        credentials (dict): Authentication details for remote access
-    """
-    try:
-        print("Trying registry detection for WSL distributions...")
-        # PowerShell command to get WSL distributions from registry
-        ps_command = '''
-        $wslDistros = @()
-        $lxssKey = "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss"
-        if (Test-Path $lxssKey) {
-            Get-ChildItem $lxssKey | ForEach-Object {
-                $distroKey = $_
-                $distroName = (Get-ItemProperty -Path $distroKey.PSPath -Name "DistributionName" -ErrorAction SilentlyContinue).DistributionName
-                $version = (Get-ItemProperty -Path $distroKey.PSPath -Name "Version" -ErrorAction SilentlyContinue).Version
-                if ($distroName) {
-                    $wslDistros += [PSCustomObject]@{
-                        Name = $distroName
-                        Version = if ($version -eq 2) { 2 } else { 1 }
-                    }
-                }
-            }
-        }
-        
-        # Also check system-wide registry path
-        $lxssKeySystem = "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss"
-        if (Test-Path $lxssKeySystem) {
-            Get-ChildItem $lxssKeySystem | ForEach-Object {
-                $distroKey = $_
-                $distroName = (Get-ItemProperty -Path $distroKey.PSPath -Name "DistributionName" -ErrorAction SilentlyContinue).DistributionName
-                $version = (Get-ItemProperty -Path $distroKey.PSPath -Name "Version" -ErrorAction SilentlyContinue).Version
-                if ($distroName) {
-                    $found = $false
-                    foreach ($d in $wslDistros) {
-                        if ($d.Name -eq $distroName) {
-                            $found = $true
-                            break
-                        }
-                    }
-                    if (-not $found) {
-                        $wslDistros += [PSCustomObject]@{
-                            Name = $distroName
-                            Version = if ($version -eq 2) { 2 } else { 1 }
-                        }
-                    }
-                }
-            }
-        }
-        
-        $wslDistros | ConvertTo-Json
-        '''
-        
-        if target_system:
-            cmd = _create_remote_command(["powershell", "-Command", ps_command], target_system, credentials)
-        else:
-            cmd = ["powershell", "-Command", ps_command]
-            
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        
-        if output.returncode == 0 and output.stdout.strip():
-            try:
-                # Parse the JSON output
-                distro_data = json.loads(output.stdout.strip())
-                
-                # Convert to array if single object
-                if isinstance(distro_data, dict):
-                    distro_data = [distro_data]
-                
-                # Format each distribution
-                distribution_list = []
-                for distro in distro_data:
-                    distribution_list.append({
-                        "name": distro.get("Name", "Unknown"),
-                        "state": "Unknown",  # Can't get state from registry
-                        "version": int(distro.get("Version", 2))  # Default to WSL 2
-                    })
-                
-                # Update the results
-                results["wsl"]["distributions"] = distribution_list
-                
-                # Add findings for WSL1 distributions
-                for distro in distribution_list:
-                    if distro["version"] == 1:
-                        results["findings"].append({
-                            "severity": "medium", 
-                            "category": "WSL Security",
-                            "description": f"Distribution '{distro['name']}' uses WSL 1, which has weaker isolation than WSL 2",
-                            "remediation": f"Convert to WSL 2 with 'wsl --set-version {distro['name']} 2'",
-                            "compliance": ["CIS 1.1.1", "NIST SP 800-190"]
-                        })
-            except json.JSONDecodeError:
-                # If JSON parsing fails, try one more fallback
-                print("Registry detection failed, trying last resort method...")
-                _try_last_resort_detection(results, target_system, credentials)
-    except Exception as e:
-        print(f"Error during registry detection: {str(e)}")
-        # Try fallback detection as last resort
-        _try_last_resort_detection(results, target_system, credentials)
-
-def _try_last_resort_detection(results, target_system=None, credentials=None):
-    """
-    Last resort detection method for WSL distributions.
+    # Extract major version for compatibility check
+    major_version = win_ver[0].split('.')[0]  # Just take the first number
     
-    Args:
-        results (dict): Results dictionary to update
-        target_system (str): Remote system to audit (None for local)
-        credentials (dict): Authentication details for remote access
-    """
-    try:
-        print("Using last resort detection for WSL distributions...")
-        # Simple command to check for Ubuntu folder in Windows apps
-        ps_command = '''
-        $ubuntuFolder = Test-Path "$env:LOCALAPPDATA\\Packages\\CanonicalGroupLimited.Ubuntu*"
-        $kaliFolder = Test-Path "$env:LOCALAPPDATA\\Packages\\KaliLinux*"
-        $debianFolder = Test-Path "$env:LOCALAPPDATA\\Packages\\TheDebianProject.DebianGNULinux*"
-        $suseFolder = Test-Path "$env:LOCALAPPDATA\\Packages\\*SUSE*"
-        $fedoraFolder = Test-Path "$env:LOCALAPPDATA\\Packages\\*Fedora*"
-        $found = @()
-        
-        if ($ubuntuFolder) { $found += "Ubuntu" }
-        if ($kaliFolder) { $found += "Kali Linux" }
-        if ($debianFolder) { $found += "Debian" }
-        if ($suseFolder) { $found += "SUSE" }
-        if ($fedoraFolder) { $found += "Fedora" }
-        
-        # Basic check for running WSL process
-        $wslProcess = Get-Process -Name "wsl" -ErrorAction SilentlyContinue
-        $wslRunning = $wslProcess -ne $null
-        
-        ConvertTo-Json @{
-            'DistrosFound' = $found
-            'WslRunning' = $wslRunning
-        }
-        '''
-        
-        if target_system:
-            cmd = _create_remote_command(["powershell", "-Command", ps_command], target_system, credentials)
-        else:
-            cmd = ["powershell", "-Command", ps_command]
-            
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        
-        if output.returncode == 0 and output.stdout.strip():
-            try:
-                data = json.loads(output.stdout.strip())
-                distros_found = data.get('DistrosFound', [])
-                wsl_running = data.get('WslRunning', False)
-                
-                # Create entries for found distributions
-                distribution_list = []
-                for distro_name in distros_found:
-                    distribution_list.append({
-                        "name": distro_name,
-                        "state": "Running" if wsl_running else "Stopped",
-                        "version": 2  # Assume WSL 2
-                    })
-                
-                # Update the results if we found distributions
-                if distribution_list:
-                    results["wsl"]["distributions"] = distribution_list
-                    print(f"Last resort detection found distributions: {', '.join(distros_found)}")
-                    
-                    # Add a warning about the detection method
-                    results["findings"].append({
-                        "severity": "warning",
-                        "category": "WSL Detection",
-                        "description": "WSL distributions were detected using a fallback method. Some security checks may be limited.",
-                        "remediation": "Ensure WSL is properly configured and accessible."
-                    })
-            except json.JSONDecodeError:
-                print("Failed to parse last resort detection output")
-                # No distributions found or parsing failed
-                results["findings"].append({
-                    "severity": "info",
-                    "category": "WSL Configuration",
-                    "description": "Could not reliably detect WSL distributions"
-                })
-    except Exception as e:
-        print(f"Error in last resort detection: {str(e)}")
-        results["findings"].append({
-            "severity": "error",
-            "category": "WSL Detection",
-            "description": f"All detection methods failed: {str(e)}"
-        })
-
-def _check_wsl_distro_security(distro_name, target_system=None, credentials=None):
-    """
-    Check security configuration of a specific WSL distribution.
-    
-    Args:
-        distro_name (str): Name of the WSL distribution
-        target_system (str): Remote system to audit (None for local)
-        credentials (dict): Authentication details for remote access
-        
-    Returns:
-        dict: Security findings for the specified distribution
-    """
-    results = {
-        "distribution": distro_name,
-        "findings": []
+    compatibility = {
+        "version": win_ver[0],
+        "build": win_ver[1],
+        "compatible": True,
+        "features": []
     }
     
-    # Clean distribution name - remove null characters and other problematic characters
-    cleaned_distro = distro_name
-    if not cleaned_distro or "\u0000" in cleaned_distro:
-        # Skip distributions with null characters
-        results["findings"].append({
-            "severity": "warning",
-            "category": "WSL Distribution",
-            "description": f"Skipping distribution with invalid name: {repr(distro_name)}"
-        })
-        return results
+    # Windows 10/11 specific features
+    if major_version in ['10', '11']:
+        compatibility["features"] = ["AppLocker", "WDAC", "Defender ATP", "Containers"]
     
-    # Check for sensitive mounts with timeout protection
-    try:
-        print(f"Checking mounts for {distro_name}...")
-        wsl_command = f"mount | grep -E '/mnt/[cd]|/mnt/host' || echo 'No system mounts found'"
-        
-        if target_system:
-            cmd = _create_remote_command(
-                ["wsl", "-d", cleaned_distro, "bash", "-c", f"'{wsl_command}'"],
-                target_system, credentials
-            )
-        else:
-            cmd = ["wsl", "-d", cleaned_distro, "bash", "-c", wsl_command]
-            
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        
-        if output.returncode == 0 and "No system mounts found" not in output.stdout:
-            results["findings"].append({
-                "severity": "high",
-                "category": "WSL File System",
-                "description": "System drives automatically mounted in WSL, presenting potential data exfiltration risk",
-                "remediation": "Consider unmounting sensitive drives or restricting access",
-                "compliance": ["CIS 1.1.3"]
-            })
-    except Exception as e:
-        print(f"Error checking WSL mounts for {distro_name}: {str(e)}")
-        results["findings"].append({
-            "severity": "error",
-            "category": "WSL Mounts",
-            "description": f"Error checking WSL mounts: {str(e)}"
-        })
-    
-    # Check for privileged users with timeout protection
-    try:
-        print(f"Checking privileged users for {distro_name}...")
-        wsl_command = "grep -E '^sudo|^wheel' /etc/group | cut -d: -f4 || echo 'No sudo users found'"
-        
-        if target_system:
-            cmd = _create_remote_command(
-                ["wsl", "-d", cleaned_distro, "bash", "-c", f"'{wsl_command}'"],
-                target_system, credentials
-            )
-        else:
-            cmd = ["wsl", "-d", cleaned_distro, "bash", "-c", wsl_command]
-            
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        
-        if output.returncode == 0 and "No sudo users found" not in output.stdout and output.stdout.strip():
-            sudo_users = output.stdout.strip().split(',')
-            if len(sudo_users) > 1:
-                results["findings"].append({
-                    "severity": "medium",
-                    "category": "WSL Privileges",
-                    "description": f"Multiple users ({len(sudo_users)}) have sudo privileges in WSL distribution",
-                    "remediation": "Limit privileged access to required users only",
-                    "compliance": ["CIS 1.1.5"]
-                })
-    except Exception as e:
-        print(f"Error checking WSL privileged users for {distro_name}: {str(e)}")
-        results["findings"].append({
-            "severity": "error",
-            "category": "WSL Users",
-            "description": f"Error checking WSL privileged users: {str(e)}"
-        })
-    
-    # Check for exposed network services with timeout protection
-    try:
-        print(f"Checking network services for {distro_name}...")
-        wsl_command = "netstat -tuln | grep 'LISTEN' | grep -v '127.0.0.1' | grep -v '::1' || echo 'No exposed services found'"
-        
-        if target_system:
-            cmd = _create_remote_command(
-                ["wsl", "-d", cleaned_distro, "bash", "-c", f"'{wsl_command}'"],
-                target_system, credentials
-            )
-        else:
-            cmd = ["wsl", "-d", cleaned_distro, "bash", "-c", wsl_command]
-            
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        
-        if output.returncode == 0 and "No exposed services found" not in output.stdout and output.stdout.strip():
-            service_count = len(output.stdout.strip().split('\n'))
-            if service_count > 0:
-                results["findings"].append({
-                    "severity": "high",
-                    "category": "WSL Network",
-                    "description": f"{service_count} network services exposed beyond localhost in WSL distribution",
-                    "remediation": "Configure services to listen only on localhost or restrict with firewall",
-                    "compliance": ["CIS 1.1.6", "NIST SP 800-190"]
-                })
-    except Exception as e:
-        print(f"Error checking WSL network services for {distro_name}: {str(e)}")
-        results["findings"].append({
-            "severity": "error",
-            "category": "WSL Network",
-            "description": f"Error checking WSL network services: {str(e)}"
-        })
-    
-    # Check for container engines within WSL with timeout protection
-    try:
-        print(f"Checking container engines for {distro_name}...")
-        wsl_command = "command -v docker podman containerd cri-o >/dev/null && echo 'Container engine found' || echo 'No container engine found'"
-        
-        if target_system:
-            cmd = _create_remote_command(
-                ["wsl", "-d", cleaned_distro, "bash", "-c", f"'{wsl_command}'"],
-                target_system, credentials
-            )
-        else:
-            cmd = ["wsl", "-d", cleaned_distro, "bash", "-c", wsl_command]
-            
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        
-        if output.returncode == 0 and "Container engine found" in output.stdout:
-            results["findings"].append({
-                "severity": "medium",
-                "category": "WSL Containers",
-                "description": "Container engine detected within WSL distribution, creating nested container scenario",
-                "remediation": "Consider security implications of nested containers and potential privilege escalation",
-                "compliance": ["NIST SP 800-190"]
-            })
-    except Exception as e:
-        print(f"Error checking for container engines in WSL for {distro_name}: {str(e)}")
-        results["findings"].append({
-            "severity": "error",
-            "category": "WSL Containers",
-            "description": f"Error checking for container engines in WSL: {str(e)}"
-        })
-    
-    return results
+    return compatibility
 
-def _check_windows_features(feature_names, target_system=None, credentials=None):
-    """
-    Check if specific Windows features are installed.
+def run_standard_audit():
+    """Run a standard security audit in interactive mode."""
+    modules = {
+        "users": ("Users and Groups", run_user_groups),
+        "shares": ("File and Share Permissions", run_file_shares),
+        "registry": ("Registry Permissions", run_registry_audit),
+        "services": ("Services and Tasks", run_services_tasks),
+        "policy": ("Local Security Policy", run_local_policy),
+        "domain": ("Domain Trusts and Sessions", run_domain_info)
+    }
     
-    Args:
-        feature_names (list): List of Windows feature names to check
-        target_system (str): Remote system to audit (None for local)
-        credentials (dict): Authentication details for remote access
-        
-    Returns:
-        dict: Mapping of feature names to boolean installation status
-    """
+    print("\n=== Standard Security Audit ===")
+    print("Select modules to run (comma-separated), or type 'all' to run all.")
+    for key, (label, _) in modules.items():
+        print(f"  {key}. {label}")
+    
+    selected = input("\nEnter module selection (or 'all'): ").strip().lower()
+    
+    selected_modules = {}
+    if selected == "all":
+        selected_modules = modules
+    else:
+        for key in selected.split(','):
+            key = key.strip()
+            if key in modules:
+                selected_modules[key] = modules[key]
+    
+    if not selected_modules:
+        print("[!] No valid modules selected. Returning to menu.")
+        return
+    
+    # Run selected modules
     results = {}
+    all_risks = []
     
-    feature_list = ','.join([f"'{feature}'" for feature in feature_names])
-    ps_command = f"Get-WindowsOptionalFeature -Online | Where-Object {{ ${feature_list} -contains $_.FeatureName }} | Select-Object FeatureName, State | ConvertTo-Json"
-    
-    try:
-        if target_system:
-            cmd = _create_remote_command(
-                ["powershell", "-Command", ps_command],
-                target_system, credentials
-            )
-        else:
-            cmd = ["powershell", "-Command", ps_command]
-            
-        output = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    for key, (label, func) in selected_modules.items():
+        print(f"\n[*] Running {label}...")
+        module_results = func()
+        results[label] = module_results
         
-        if output.returncode == 0 and output.stdout.strip():
-            try:
-                features_data = json.loads(output.stdout)
-                # Handle single item not being in a list
-                if not isinstance(features_data, list):
-                    features_data = [features_data]
-                    
-                for feature in features_data:
-                    results[feature["FeatureName"]] = (feature["State"] == "Enabled")
-            except json.JSONDecodeError:
-                # No results or invalid JSON
-                pass
-    except Exception:
-        # Error running command, features assumed not installed
-        pass
+        # Collect risks
+        if isinstance(module_results, dict) and "_risks" in module_results:
+            all_risks.extend(module_results["_risks"])
     
-    # Set default value for features not found
-    for feature in feature_names:
-        if feature not in results:
-            results[feature] = False
+    # Output options
+    print("\nAvailable output formats: txt, json, pdf, html, csv, all")
+    formats = input("Enter output format(s) (comma-separated or 'all'): ").strip().lower().split(",")
+    formats = [f.strip() for f in formats if f.strip()]
     
-    return results
+    if "all" in formats:
+        formats = ["txt", "json", "pdf", "html", "csv"]
+    
+    if not formats:
+        print("[!] No valid output formats selected. Using JSON as default.")
+        formats = ["json"]
+    
+    # Report name
+    default_name = f"dumpsec_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    report_name = input(f"Enter report name (default: {default_name}): ").strip() or default_name
+    
+    # Risk level filtering
+    min_risk = input("Minimum risk severity to include (low, medium, high)? Leave blank for all: ").strip().lower()
+    min_risk = min_risk if min_risk in ["low", "medium", "high"] else None
+    
+    # Map to compliance frameworks?
+    map_compliance = input("Map findings to compliance frameworks? (y/n): ").strip().lower() == 'y'
+    
+    if map_compliance:
+        print("\n[*] Mapping findings to compliance frameworks...")
+        compliance_report = run_compliance(all_risks)
+        results["Compliance Mapping"] = compliance_report
+    
+    # Generate reports
+    for fmt in formats:
+        write_report(results, fmt, report_name, min_risk)
+        print(f"[+] Saved {report_name}.{fmt}")
 
-def _create_remote_command(command, target_system, credentials):
-    """
-    Create a command for remote execution via WinRM/PowerShell.
+# Add these functions after the interactive_menu() function
+
+def run_standard_audit():
+    """Run a standard security audit in interactive mode."""
+    modules = {
+        "users": ("Users and Groups", run_user_groups),
+        "shares": ("File and Share Permissions", run_file_shares),
+        "registry": ("Registry Permissions", run_registry_audit),
+        "services": ("Services and Tasks", run_services_tasks),
+        "policy": ("Local Security Policy", run_local_policy),
+        "domain": ("Domain Trusts and Sessions", run_domain_info)
+    }
     
-    Args:
-        command (list): Local command to convert for remote execution
-        target_system (str): Target system hostname or IP
-        credentials (dict): Authentication details for remote access
+    print("\n=== Standard Security Audit ===")
+    print("Select modules to run (comma-separated), or type 'all' to run all.")
+    for key, (label, _) in modules.items():
+        print(f"  {key}. {label}")
+    
+    selected = input("\nEnter module selection (or 'all'): ").strip().lower()
+    
+    selected_modules = {}
+    if selected == "all":
+        selected_modules = modules
+    else:
+        for key in selected.split(','):
+            key = key.strip()
+            if key in modules:
+                selected_modules[key] = modules[key]
+    
+    if not selected_modules:
+        print("[!] No valid modules selected. Returning to menu.")
+        return
+    
+    # Run selected modules
+    results = {}
+    all_risks = []
+    
+    for key, (label, func) in selected_modules.items():
+        print(f"\n[*] Running {label}...")
+        module_results = func()
+        results[label] = module_results
         
-    Returns:
-        list: Command modified for remote execution
-    """
-    # Convert command list to string
-    cmd_str = ' '.join(command)
+        # Collect risks
+        if isinstance(module_results, dict) and "_risks" in module_results:
+            all_risks.extend(module_results["_risks"])
     
-    # Create remote PowerShell command
-    remote_cmd = [
-        "powershell",
-        "-Command",
-        f"$secpass = ConvertTo-SecureString '{credentials.get('password', '')}' -AsPlainText -Force; " +
-        f"$cred = New-Object System.Management.Automation.PSCredential('{credentials.get('username', '')}', $secpass); " +
-        f"Invoke-Command -ComputerName {target_system} -Credential $cred -ScriptBlock {{ {cmd_str} }}"
-    ]
+    # Output options
+    print("\nAvailable output formats: txt, json, pdf, html, csv, all")
+    formats = input("Enter output format(s) (comma-separated or 'all'): ").strip().lower().split(",")
+    formats = [f.strip() for f in formats if f.strip()]
     
-    return remote_cmd
+    if "all" in formats:
+        formats = ["txt", "json", "pdf", "html", "csv"]
+    
+    if not formats:
+        print("[!] No valid output formats selected. Using JSON as default.")
+        formats = ["json"]
+    
+    # Report name
+    default_name = f"dumpsec_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    report_name = input(f"Enter report name (default: {default_name}): ").strip() or default_name
+    
+    # Risk level filtering
+    min_risk = input("Minimum risk severity to include (low, medium, high)? Leave blank for all: ").strip().lower()
+    min_risk = min_risk if min_risk in ["low", "medium", "high"] else None
+    
+    # Map to compliance frameworks?
+    map_compliance = input("Map findings to compliance frameworks? (y/n): ").strip().lower() == 'y'
+    
+    if map_compliance:
+        print("\n[*] Mapping findings to compliance frameworks...")
+        compliance_report = run_compliance(all_risks)
+        results["Compliance Mapping"] = compliance_report
+    
+    # Generate reports
+    for fmt in formats:
+        write_report(results, fmt, report_name, min_risk)
+        print(f"[+] Saved {report_name}.{fmt}")
+
+def run_advanced_audit():
+    """Run an advanced security audit with all modules."""
+    all_modules = get_all_modules()
+    
+    if not all_modules:
+        print("[!] Error: No audit modules available. Check module installation.")
+        return
+    
+    print("\n=== Advanced Security Audit ===")
+    print("This will run all security audit modules, including:")
+    print("- Standard modules (Users, Shares, Registry, Services, Policy, Domain)")
+    print("- Windows Event Log analysis")
+    print("- PowerShell security audit")
+    print("- Windows Defender/ATP analysis")
+    print("- WSL and Container security audit")
+    
+    confirm = input("\nThis may take several minutes to complete. Continue? (y/n): ").strip().lower()
+    if confirm != 'y':
+        print("Advanced audit cancelled.")
+        return
+    
+    # Run all modules
+    results = {}
+    all_risks = []
+    
+    for key, (label, func) in all_modules.items():
+        print(f"\n[*] Running {label}...")
+        try:
+            module_results = func()
+            
+            # Ensure we always have a valid dictionary result
+            if module_results is None:
+                print(f"[!] Warning: {label} module returned None")
+                module_results = {"Error": "Module returned None"}
+            
+            results[label] = module_results
+            
+            # Collect risks safely
+            if isinstance(module_results, dict) and "_risks" in module_results:
+                # Ensure risks is an iterable
+                risks = module_results["_risks"]
+                if risks is not None:
+                    all_risks.extend(risks)
+        except Exception as e:
+            print(f"[!] Error in {label} module: {str(e)}")
+            results[label] = {"Error": str(e)}
+    
+    # Continue only if we have results
+    if not results:
+        print("[!] No results collected. Audit failed.")
+        return
+    
+    # Output options
+    print("\nAvailable output formats: txt, json, pdf, html, csv, all")
+    formats = input("Enter output format(s) (comma-separated or 'all'): ").strip().lower().split(",")
+    formats = [f.strip() for f in formats if f.strip()]
+    
+    if "all" in formats:
+        formats = ["txt", "json", "pdf", "html", "csv"]
+    
+    if not formats:
+        print("[!] No valid output formats selected. Using JSON as default.")
+        formats = ["json"]
+    
+    # Report name
+    default_name = f"dumpsec_advanced_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    report_name = input(f"Enter report name (default: {default_name}): ").strip() or default_name
+    
+    # Risk level filtering
+    min_risk = input("Minimum risk severity to include (low, medium, high)? Leave blank for all: ").strip().lower()
+    min_risk = min_risk if min_risk in ["low", "medium", "high"] else None
+    
+    # Map to compliance frameworks (automatic for advanced audit)
+    try:
+        print("\n[*] Mapping findings to compliance frameworks...")
+        from compliance import run as run_compliance
+        compliance_report = run_compliance(all_risks)
+        results["Compliance Mapping"] = compliance_report
+    except ImportError:
+        print("[!] Warning: compliance module not found or not yet implemented")
+    except Exception as e:
+        print(f"[!] Error mapping to compliance frameworks: {str(e)}")
+    
+    # Generate reports
+    for fmt in formats:
+        try:
+            from report_writer import write_report
+            write_report(results, fmt, report_name, min_risk)
+            print(f"[+] Saved {report_name}.{fmt}")
+        except Exception as e:
+            print(f"[!] Error generating {fmt} report: {str(e)}")
+
+def main():
+    """Main entry point for DumpSec-Py."""
+    args = None  # Initialize args to avoid UnboundLocalError
+    try:
+        # Load version from file
+        try:
+            with open('version.txt', 'r') as f:
+                version = f.read().strip()
+        except Exception:
+            version = "Unknown"
+
+        # Print banner
+        print(f"""
+    ____                      ____             ____       
+   / __ \\__  ______ ___  ____/ / /___ _____   / __ \\__  __
+  / / / / / / / __ `__ \\/ __  / / __ `/ __ \\ / /_/ / / / /
+ / /_/ / /_/ / / / / / / /_/ / / /_/ / /_/ // ____/ /_/ / 
+/_____/\\__,_/_/ /_/ /_/\\__,_/_/\\__,_/ .___//_/    \\__, /  
+                                   /_/           /____/   
+                                   
+ Windows Security Auditing Tool v{version}
+ (c) 2025 Red Cell Security, LLC
+""")
+        
+        # Check Windows version compatibility
+        win_compat = check_windows_version()
+        print(f"[*] Windows Version: {win_compat['version']} (Build {win_compat['build']})")
+        if not win_compat['compatible']:
+            print("[!] Warning: This Windows version may not be fully supported.")
+        
+        # Check for updates
+        from updater import check_for_updates
+        updated = check_for_updates()
+        if updated:
+            print("[*] Please restart the tool to use the updated version.")
+            return
+        
+        # Parse command line arguments
+        args = parse_args()
+        
+        # Handle different modes
+        if args.watch:
+            print("[*] Starting real-time change monitoring...")
+            monitor_changes()
+        elif args.compare:
+            compare_reports(args)
+        elif args.remote:
+            remote_mode(args)
+        elif args.gui:
+            # Import and launch GUI
+            try:
+                from gui import main as gui_main
+                gui_main()
+            except ImportError:
+                print("[!] GUI dependencies not found. Please install PyQt5.")
+                print("    pip install PyQt5")
+        elif args.output_format:
+            cli_mode(args)
+        else:
+            # No arguments provided, run in interactive menu
+            interactive_menu()
+            
+    except KeyboardInterrupt:
+        print("\n[!] Keyboard interrupt received. Exiting.")
+    except Exception as e:
+        print(f"\n[!] An error occurred: {e}")
+        
+        # If debug mode is enabled, print traceback
+        if args and hasattr(args, 'debug') and args.debug:
+            import traceback
+            traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
