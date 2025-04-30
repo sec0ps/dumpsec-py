@@ -78,6 +78,9 @@ python main.py --watch
 
 © 2025 Keith Pachulski. All rights reserved.
 
+## Contact
+For professional services, integrations, or support contact: operations@redcellsecurity.org
+
 **License**: This software is licensed under the MIT License. You are free to use, modify, and distribute this software in accordance with the terms of the license.
 
 **Purpose**: This script is part of the DumpSec-Py tool, which is designed to perform detailed security audits on Windows systems. It covers user rights, services, registry permissions, file/share permissions, group policy enumeration, risk assessments, and more.
